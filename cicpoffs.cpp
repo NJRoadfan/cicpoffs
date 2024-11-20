@@ -10,7 +10,6 @@
 #include "cicpoffs.hpp"
 #include "cicpps.hpp"
 extern "C"{
-#include <ulockmgr.h>
 #include <errno.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -63,7 +62,6 @@ static struct fuse_operations operations = {
 	.create = fuse_fn_create,
 	//.ftruncate = fuse_fn_ftruncate,
 	//.fgetattr = fuse_fn_fgetattr,
-	.lock = fuse_fn_lock,
 	.utimens = fuse_fn_utimens,
 	//.bmap = <unimplemented> - not for block devices,
 	//.ioctl = fuse_fn_ioctl,
@@ -328,10 +326,6 @@ int   (fuse_fn_fgetattr)    (const char* path, struct stat* st, struct fuse_file
 	int retval = fstat(ffi->fh, st);
 	if(retval==-1) return -errno;
 	return retval;
-};
-
-int   (fuse_fn_lock)        (const char* path, struct fuse_file_info* ffi, int cmd, struct flock* lock){
-	return ulockmgr_op(ffi->fh, cmd, lock, &ffi->lock_owner, sizeof(ffi->lock_owner));
 };
 
 int   (fuse_fn_utimens)     (const char* path, const struct timespec ts[2], struct fuse_file_info* ffi){
