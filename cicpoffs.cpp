@@ -5,16 +5,21 @@
  * CICPOFFS is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation version 2 of the License.
+ *
+ * User context switching when using "-o allow_other"
+ * adapted from CIOPFS v0.4.
+ * (c) 2008 Marc Andre Tanner <mat at brain-dump dot org>
+ * (c) 2001-2007 Miklos Szeredi <miklos@szeredi.hu>
  */
 
 #include "cicpoffs.hpp"
 #include "cicpps.hpp"
 extern "C"{
-#include <ulockmgr.h>
 #include <errno.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <grp.h>
 #include <time.h>
 #include <string.h>
 #include <stdlib.h>
@@ -26,6 +31,8 @@ extern "C"{
 }
 
 #define VERSION "0.0.2"
+
+extern bool single_threaded;
 
 static struct fuse_operations operations = {
 	.getattr = fuse_fn_getattr,
@@ -63,7 +70,6 @@ static struct fuse_operations operations = {
 	.create = fuse_fn_create,
 	//.ftruncate = fuse_fn_ftruncate,
 	//.fgetattr = fuse_fn_fgetattr,
-	.lock = fuse_fn_lock,
 	.utimens = fuse_fn_utimens,
 	//.bmap = <unimplemented> - not for block devices,
 	//.ioctl = fuse_fn_ioctl,
@@ -84,6 +90,155 @@ static void ignore_print(const char* msg){};
 
 static void (*logmsg) (const char* msg) = ignore_print;
 
+/* Returns the supplementary group IDs of a calling process which
+ * isued the file system operation.
+ *
+ * As indicated by Miklos Szeredi the group list is available in
+ *
+ *   /proc/$PID/task/$TID/status
+ *
+ * and fuse supplies TID in get_fuse_context()->pid.
+ *
+ * Jean-Pierre Andre found out that the same information is also
+ * available in
+ *
+ *   /proc/$TID/task/$TID/status
+ *
+ * which is used in this implementation.
+ */
+
+static size_t get_groups(pid_t pid, gid_t **groups)
+{
+	static char key[] = "\nGroups:\t";
+	char filename[64], buf[2048], *s, *t, c = '\0';
+	int fd, num_read, matched = 0;
+	size_t n = 0;
+	gid_t *gids, grp = 0;
+
+	sprintf(filename, "/proc/%u/task/%u/status", pid, pid);
+	fd = open(filename, O_RDONLY);
+	if (fd == -1)
+		return 0;
+
+	for (;;) {
+		if (!c) {
+			num_read = read(fd, buf, sizeof(buf) - 1);
+			if (num_read <= 0) {
+				close(fd);
+				return 0;
+			}
+			buf[num_read] = '\0';
+			s = buf;
+		}
+
+		c = *s++;
+
+		if (key[matched] == c) {
+			if (!key[++matched])
+				break;
+
+		} else
+			matched = (key[0] == c);
+	}
+
+	close(fd);
+	t = s;
+	n = 0;
+
+	while (*t != '\n') {
+		if (*t++ == ' ')
+			n++;
+	}
+
+	if (n == 0)
+		return 0;
+
+	*groups = gids = (gid_t*) malloc(n * sizeof(gid_t));
+	if (!gids)
+		return 0;
+	n = 0;
+
+	while ((c = *s++) != '\n') {
+		if (c >= '0' && c <= '9')
+			grp = grp*10 + c - '0';
+		else if (c == ' ') {
+			gids[n++] = grp;
+			grp = 0;
+		}
+	}
+
+	return n;
+}
+
+/* This only works when the filesystem is mounted by root and fuse
+ * operates in single threaded mode. Because the euid/egid are stored
+ * per process this would otherwise cause all sorts of race condidtions
+ * and security issues when multiple users access the file system
+ * simultaneously.
+ */
+
+static void enter_user_context_effective()
+{
+	gid_t *groups;
+	size_t ngroups;
+	struct fuse_context *c = fuse_get_context();
+
+	if (!single_threaded || getuid())
+		return;
+	if ((ngroups = get_groups(c->pid, &groups))) {
+		setgroups(ngroups, groups);
+		free(groups);
+	}
+
+	setegid(c->gid);
+	seteuid(c->uid);
+}
+
+static void leave_user_context_effective()
+{
+	if (!single_threaded || getuid())
+		return;
+
+	seteuid(getuid());
+	setegid(getgid());
+}
+
+/* access(2) checks the real uid/gid not the effective one
+ * we therefore switch them if run as root and in single
+ * threaded mode.
+ *
+ * The real uid/gid are stored per process which is why we
+ * can't change them in multithreaded mode. This would lead
+ * to all sorts of race conditions and security issues when
+ * multiple users access the file system simultaneously.
+ *
+ */
+
+static void enter_user_context_real()
+{
+	gid_t *groups;
+	size_t ngroups;
+	struct fuse_context *c = fuse_get_context();
+
+	if (!single_threaded || geteuid())
+		return;
+	if ((ngroups = get_groups(c->pid, &groups))) {
+		setgroups(ngroups, groups);
+		free(groups);
+	}
+	setregid(c->gid, -1);
+	setreuid(c->uid, -1);
+}
+
+static void leave_user_context_real()
+{
+	if (!single_threaded || geteuid())
+		return;
+
+	setuid(geteuid());
+	setgid(getegid());
+}
+
 void* (fuse_fn_init)        (struct fuse_conn_info* conn, struct fuse_config* cfg){
 	struct stat st;
 	if(stat(read_source_directory, &st)){
@@ -94,7 +249,17 @@ void* (fuse_fn_init)        (struct fuse_conn_info* conn, struct fuse_config* cf
 		logmsg("Path must be absolute.");
 		exit(ENOENT);
 	}
-	
+	cfg->use_ino = 1;
+        /* Pick up changes from lower filesystem right away. This is
+           also necessary for better hardlink support. When the kernel
+           calls the unlink() handler, it does not know the inode of
+           the to-be-removed entry and can therefore not invalidate
+           the cache of the associated inode - resulting in an
+           incorrect st_nlink value being reported for any remaining
+           hardlinks to this inode. */
+        cfg->entry_timeout = 0;
+        cfg->attr_timeout = 0;
+        cfg->negative_timeout = 0;
 	return NULL;
 };
 
@@ -104,7 +269,9 @@ void  (fuse_fn_destroy)     (void* private_data){
 
 int   (fuse_fn_getattr)     (const char* path, struct stat* stbuf, struct fuse_file_info* fi){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = stat(correctpath, stbuf);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	if(retval==-1) return -errno;
 	return retval;
@@ -112,42 +279,54 @@ int   (fuse_fn_getattr)     (const char* path, struct stat* stbuf, struct fuse_f
 
 int   (fuse_fn_readlink)    (const char* path, char* buf, size_t size){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = readlink(correctpath, buf, size);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	return retval;
 };
 
 int   (fuse_fn_mknod)       (const char* path, mode_t mode, dev_t rdev){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = mknod(correctpath, mode, rdev);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	return retval;
 };
 
 int   (fuse_fn_mkdir)       (const char* path, mode_t mode){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = mkdir(correctpath, mode);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	return retval;
 };
 
 int   (fuse_fn_unlink)      (const char* path){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = unlink(correctpath);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	return retval;
 };
 
 int   (fuse_fn_rmdir)       (const char* path){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = rmdir(correctpath);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	return retval;
 };
 
 int   (fuse_fn_symlink)     (const char* to, const char* from){
 	const char* correctfrom = correct_case_sensitivity_for(read_source_directory, from);
+	enter_user_context_effective();
 	int retval = symlink(to, correctfrom);
+	leave_user_context_effective();
 	free((void*) correctfrom);
 	return retval;
 };
@@ -156,16 +335,31 @@ int   (fuse_fn_symlink)     (const char* to, const char* from){
 int   (fuse_fn_rename)      (const char* from, const char* to, unsigned int flags){
 	const char* correctfrom = correct_case_sensitivity_for(read_source_directory, from);
 	const char* correctto = correct_case_sensitivity_for(read_source_directory, to);
-	int retval = rename(correctfrom, correctto);
+	const char* sameto = return_to_path(read_source_directory, to);
+	enter_user_context_effective();
+	int retval;
+	//Check if user is using the same filename, but with different case ex: "my file" to "My file"
+	if (!strcmp(correctfrom,correctto))
+	{
+		retval = rename(correctfrom, sameto);
+	}
+	else
+	{
+		retval = rename(correctfrom, correctto);
+	}
+	leave_user_context_effective();
 	free((void*) correctfrom);
 	free((void*) correctto);
+	free((void*) sameto);
 	return retval;
 };
 
 int   (fuse_fn_link)        (const char* from, const char* to){
 	const char* correctfrom = correct_case_sensitivity_for(read_source_directory, from);
 	const char* correctto = correct_case_sensitivity_for(read_source_directory, to);
+	enter_user_context_effective();
 	int retval = link(correctfrom, correctto);
+	leave_user_context_effective();
 	free((void*) correctfrom);
 	free((void*) correctto);
 	return retval;
@@ -173,21 +367,27 @@ int   (fuse_fn_link)        (const char* from, const char* to){
 
 int   (fuse_fn_chmod)       (const char* path, mode_t mode, struct fuse_file_info* fi){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = chmod(correctpath, mode);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	return retval;
 };
 
 int   (fuse_fn_chown)       (const char* path, uid_t uid, gid_t gid, struct fuse_file_info*){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = chown(correctpath, uid, gid);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	return retval;
 };
 
 int   (fuse_fn_truncate)    (const char* path, off_t off, struct fuse_file_info*){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = truncate(correctpath, off);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	return retval;
 };
@@ -201,7 +401,9 @@ int   (fuse_fn_truncate)    (const char* path, off_t off, struct fuse_file_info*
 
 int   (fuse_fn_open)        (const char* path, struct fuse_file_info* ffi){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int fd = open(correctpath, ffi->flags);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	ffi->fh = fd;
 	return (fd==-1) ? -errno : 0;
@@ -217,7 +419,9 @@ int   (fuse_fn_write)       (const char* path, const char* buf, size_t size, off
 
 int   (fuse_fn_statfs)      (const char* path, struct statvfs* svfs){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = statvfs(correctpath, svfs);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	return retval;
 };
@@ -241,7 +445,9 @@ int   (fuse_fn_fsync)       (const char* path, int data_sync, struct fuse_file_i
 
 int   (fuse_fn_setxattr)    (const char* path, const char* key, const char* value, size_t size, int flags){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = lsetxattr(correctpath, key, value, size, flags);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	if(retval==-1) return -errno;
 	return retval;
@@ -249,7 +455,9 @@ int   (fuse_fn_setxattr)    (const char* path, const char* key, const char* valu
 
 int   (fuse_fn_getxattr)    (const char* path, const char* key, char* value, size_t size){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = lgetxattr(correctpath, key, value, size);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	if(retval==-1) return -errno;
 	return retval;
@@ -257,7 +465,9 @@ int   (fuse_fn_getxattr)    (const char* path, const char* key, char* value, siz
 
 int   (fuse_fn_listxattr)   (const char* path, char* list, size_t size){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = llistxattr(correctpath, list, size);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	if(retval==-1) return -errno;
 	return retval;
@@ -265,7 +475,9 @@ int   (fuse_fn_listxattr)   (const char* path, char* list, size_t size){
 
 int   (fuse_fn_removexattr) (const char* path, const char* key){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int retval = lremovexattr(correctpath, key);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	if(retval==-1) return -errno;
 	return retval;
@@ -273,7 +485,9 @@ int   (fuse_fn_removexattr) (const char* path, const char* key){
 
 int   (fuse_fn_opendir)     (const char* path, struct fuse_file_info* ffi){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	DIR* dp = opendir(correctpath);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	ffi->fh = (uintptr_t) dp;
 	return dp==NULL ? -errno : 0;
@@ -306,14 +520,18 @@ int   (fuse_fn_releasedir)  (const char* path, struct fuse_file_info* ffi){
 
 int   (fuse_fn_access)      (const char* path, int mode){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_real();
 	int retval = access(correctpath, mode);
+	leave_user_context_real();
 	free((void*) correctpath);
 	return retval;
 };
 
 int   (fuse_fn_create)      (const char* path, mode_t mode, struct fuse_file_info* ffi){
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
+	enter_user_context_effective();
 	int fd = open(correctpath, ffi->flags, mode);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	if(fd==-1) return -errno;
 	ffi->fh = fd;
@@ -321,27 +539,25 @@ int   (fuse_fn_create)      (const char* path, mode_t mode, struct fuse_file_inf
 };
 
 int   (fuse_fn_ftruncate)   (const char* path, off_t off, struct fuse_file_info* ffi){
-	return ftruncate(ffi->fh, off);
-};
-
-int   (fuse_fn_fgetattr)    (const char* path, struct stat* st, struct fuse_file_info* ffi){
-	int retval = fstat(ffi->fh, st);
-	if(retval==-1) return -errno;
+	enter_user_context_effective();
+	int retval = ftruncate(ffi->fh, off);
+	leave_user_context_effective();
 	return retval;
 };
 
-int   (fuse_fn_lock)        (const char* path, struct fuse_file_info* ffi, int cmd, struct flock* lock){
-	return ulockmgr_op(ffi->fh, cmd, lock, &ffi->lock_owner, sizeof(ffi->lock_owner));
+int   (fuse_fn_fgetattr)    (const char* path, struct stat* st, struct fuse_file_info* ffi){
+	enter_user_context_effective();
+	int retval = fstat(ffi->fh, st);
+	if(retval==-1) return -errno;
+	leave_user_context_effective();
+	return retval;
 };
 
 int   (fuse_fn_utimens)     (const char* path, const struct timespec ts[2], struct fuse_file_info* ffi){
-	struct timeval tv[2];
-	tv[0].tv_sec = ts[0].tv_sec;
-	tv[0].tv_usec = ts[0].tv_nsec / 1000;
-	tv[1].tv_sec = ts[1].tv_sec;
-	tv[1].tv_usec = ts[1].tv_nsec / 1000;
 	const char* correctpath = correct_case_sensitivity_for(read_source_directory, path);
-	int retval = utimes(correctpath, tv);
+	enter_user_context_effective();
+	int retval = utimensat(0,correctpath,ts,AT_SYMLINK_NOFOLLOW);
+	leave_user_context_effective();
 	free((void*) correctpath);
 	return retval;
 };
@@ -367,5 +583,8 @@ int   (fuse_fn_utimens)     (const char* path, const struct timespec ts[2], stru
 // };
 
 int   (fuse_fn_fallocate)   (const char* path, int mode, off_t off, off_t len, struct fuse_file_info* ffi){
-	return fallocate(ffi->fh, mode, off, len);
+	enter_user_context_effective();
+	int retval = fallocate(ffi->fh, mode, off, len);
+	leave_user_context_effective();
+	return retval;
 };

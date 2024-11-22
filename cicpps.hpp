@@ -10,3 +10,4 @@
 #pragma once
 
 const char* correct_case_sensitivity_for(const char*, const char*);
+const char* return_to_path(const char*, const char*);

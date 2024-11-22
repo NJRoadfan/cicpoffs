@@ -69,8 +69,6 @@ enum {
 	CICPOFFS_OPT_VERSION
 };
 
-static bool single_threaded = true;
-
 static void usage(const char* name){
 	fprintf(stderr, "usage: %s directory mountpoint [options]\n"
 	                "\n"
@@ -131,10 +129,13 @@ static struct fuse_opt cicpoffs_opts[] = {
 };
 
 int main(int argc, char** argv){
+	single_threaded = false;
 	argv0 = argv[0];
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 	fuse_opt_parse(&args, &read_source_directory, cicpoffs_opts, cicpoffs_opt_parse);
-
+	if (single_threaded) {
+		fuse_opt_add_arg(&args, "-s");
+	}
 	umask(0);
 	return fuse_main(args.argc, args.argv, &operations, NULL);
 }

@@ -13,6 +13,9 @@
 
 #include <fuse.h>
 
+
+bool single_threaded;
+
 // https://www.cs.hmc.edu/~geoff/classes/hmc.cs135.201001/homework/fuse/fuse_doc.html
 void* (fuse_fn_init)        (struct fuse_conn_info*, struct fuse_config*);
 void  (fuse_fn_destroy)     (void*);
@@ -48,7 +51,6 @@ int   (fuse_fn_access)      (const char*, int);
 int   (fuse_fn_create)      (const char*, mode_t, struct fuse_file_info*);
 //int   (fuse_fn_ftruncate)   (const char*, off_t, struct fuse_file_info*);
 //int   (fuse_fn_fgetattr)    (const char*, struct stat*, struct fuse_file_info*);
-int   (fuse_fn_lock)        (const char*, struct fuse_file_info*, int, struct flock*);
 int   (fuse_fn_utimens)     (const char*, const struct timespec[2], struct fuse_file_info*);
 int   (fuse_fn_bmap)        (const char*, size_t, uint64_t*);
 int   (fuse_fn_ioctl)       (const char*, int, void*, struct fuse_file_info*, unsigned int, void*);

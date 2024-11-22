@@ -97,3 +97,15 @@ const char* correct_case_sensitivity_for(const char* absolute_mp, const char* re
         return full_absolute_fixed_path;
     }
 }
+
+const char* return_to_path(const char* absolute_mp, const char* relative_cs){
+    if(absolute_mp==NULL || relative_cs==NULL) return NULL;
+    const char* relative_cs_nls = relative_cs[0]=='/' ? &relative_cs[1] : relative_cs; // remove leading slash
+    int absolute_mp_len = strlen(absolute_mp);
+    int relative_cs_nls_len = strlen(relative_cs_nls);
+    char* full_relative_path = (char*) calloc(absolute_mp_len+relative_cs_nls_len+2, sizeof(char));
+    strcpy(full_relative_path, absolute_mp);
+    full_relative_path[absolute_mp_len] = '/';
+    strcpy(&full_relative_path[absolute_mp_len+1], relative_cs_nls);
+    return full_relative_path;
+}
