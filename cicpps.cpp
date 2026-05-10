@@ -16,16 +16,13 @@
 #include <string>
 #include <filesystem>
 #include <algorithm>
+#include <unicode/unistr.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
 namespace fs = std::filesystem;
-
-std::wstring to_wide_string(std::string normal){
-    return std::wstring_convert<std::codecvt_utf8<wchar_t>>().from_bytes(normal);
-}
 
 char* clone_string(const char* source){
     char* cloned = (char*) calloc(strlen(source)+1, sizeof(char));
@@ -53,14 +50,13 @@ const char* recursively_search_case_insensitively(std::string remaining, std::st
             return recursively_search_case_insensitively(nextRemaining, desiredFragment);
         } else { // if case sensivivity here is incorrect
             bool found = false;
-            std::wstring wpart = to_wide_string(thispart);
-            std::transform(wpart.begin(), wpart.end(), wpart.begin(), std::towlower);
+	    icu::UnicodeString wpart(thispart.c_str());
+            wpart.toLower();
             for(const fs::directory_entry &entry : fs::directory_iterator(processed)){
                 std::string filename = fs::path(entry.path()).filename();
                 //fprintf(stderr, "[2] %s\n", filename.c_str());
-                std::wstring wcandidate = to_wide_string(filename);
-                std::wstring wcandidatel = wcandidate;
-                std::transform(wcandidatel.begin(), wcandidatel.end(), wcandidatel.begin(), std::towlower);
+		icu::UnicodeString wcandidatel(filename.c_str());
+                wcandidatel.toLower();
                 if(wpart==wcandidatel){
                     //fprintf(stderr, "[3] %s --replacing--> %s\n", filename.c_str(), thispart.c_str());
                     thispart = filename;

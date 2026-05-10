@@ -1,6 +1,6 @@
 #!/bin/bash
 cd /repo/packaging/arch
-pacman -Sy --noconfirm --needed base-devel fuse fuse3 attr git
+pacman -Sy --noconfirm --needed base-devel fuse fuse3 attr git icu
 useradd user -u 1000
 chown user -R ../..
 sudo -u user makepkg --skipinteg --skipchecksums --skippgpcheck
