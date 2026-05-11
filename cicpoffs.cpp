@@ -190,8 +190,14 @@ static void enter_user_context_effective()
 		free(groups);
 	}
 
-	setegid(c->gid);
-	seteuid(c->uid);
+	if (setegid(c->gid) == -1)
+	{
+		printf("setegid() failed: %s\n", strerror(errno));
+	}
+	if (seteuid(c->uid) == -1)
+        {
+                printf("seteuid() failed: %s\n", strerror(errno));
+        }
 }
 
 static void leave_user_context_effective()
@@ -199,8 +205,14 @@ static void leave_user_context_effective()
 	if (!single_threaded || getuid())
 		return;
 
-	seteuid(getuid());
-	setegid(getgid());
+        if (seteuid(getuid()) == -1)
+        {
+                printf("seteuid() failed: %s\n", strerror(errno));
+        }
+        if (setegid(getgid()) == -1)
+        {
+                printf("setguid() failed: %s\n", strerror(errno));
+        }
 }
 
 /* access(2) checks the real uid/gid not the effective one
@@ -226,8 +238,15 @@ static void enter_user_context_real()
 		setgroups(ngroups, groups);
 		free(groups);
 	}
-	setregid(c->gid, -1);
-	setreuid(c->uid, -1);
+
+        if (setregid(c->gid, -1) == -1)
+        {
+                printf("setregid() failed: %s\n", strerror(errno));
+        }
+        if (setreuid(c->uid, -1) == -1)
+        {
+                printf("setreuid() failed: %s\n", strerror(errno));
+        }
 }
 
 static void leave_user_context_real()
@@ -235,8 +254,14 @@ static void leave_user_context_real()
 	if (!single_threaded || geteuid())
 		return;
 
-	setuid(geteuid());
-	setgid(getegid());
+        if (setuid(geteuid()) == -1)
+        {
+                printf("setuid() failed: %s\n", strerror(errno));
+        }
+        if (setgid(getegid()) == -1)
+        {
+                printf("setgid() failed: %s\n", strerror(errno));
+        }
 }
 
 void* (fuse_fn_init)        (struct fuse_conn_info* conn, struct fuse_config* cfg){
